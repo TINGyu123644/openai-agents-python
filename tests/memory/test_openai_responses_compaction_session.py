@@ -2574,3 +2574,33 @@ class TestTypeGuard:
 
     def test_is_compaction_aware_session_none(self) -> None:
         assert is_openai_responses_compaction_aware_session(None) is False
+
+
+class TestCompactionReplayStripsCreatedBy:
+    """A stored compaction item must not replay its output-only ``created_by`` field.
+
+    ``OpenAIResponsesCompactionSession`` stores the raw ``responses.compact()`` output, which
+    carries ``created_by``. The Responses input-item schema has no such field, so the next turn's
+    replayed history was rejected with a 400 ``Unknown parameter: 'input[N].created_by'``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_prepare_input_drops_created_by_from_stored_compaction_item(self) -> None:
+        compaction_item = cast(
+            TResponseInputItem,
+            {
+                "type": "compaction",
+                "id": "compaction_1",
+                "encrypted_content": "blob",
+                "created_by": "server",
+            },
+        )
+        session = SimpleListSession(history=[compaction_item])
+
+        prepared_input, _ = await prepare_input_with_session("next turn", session, None)
+
+        assert isinstance(prepared_input, list)
+        replayed = [item for item in prepared_input if isinstance(item, dict)]
+        assert replayed, "expected the stored compaction item to be replayed"
+        assert all("created_by" not in item for item in replayed)
+        assert {"type": "compaction", "id": "compaction_1", "encrypted_content": "blob"} in replayed

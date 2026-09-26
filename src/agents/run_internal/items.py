@@ -25,6 +25,10 @@ from ..tool import DEFAULT_APPROVAL_REJECTION_MESSAGE
 REJECTION_MESSAGE = DEFAULT_APPROVAL_REJECTION_MESSAGE
 TOOL_CALL_SESSION_DESCRIPTION_KEY = "_agents_tool_description"
 TOOL_CALL_SESSION_TITLE_KEY = "_agents_tool_title"
+# Provider output-only field carried on ResponseCompactionItem; it has no
+# counterpart on the input param type, so replaying it is rejected with a 400
+# "Unknown parameter: 'input[N].created_by'".
+CREATED_BY_KEY = "created_by"
 _NESTED_HISTORY_RUN_ITEM_OCCURRENCE_KEY = "_agents_nested_history_occurrence_key"
 _TOOL_CALL_TO_OUTPUT_TYPE: dict[str, str] = {
     "program": "program_output",
@@ -713,13 +717,20 @@ def _dedupe_key(item: TResponseInputItem) -> str | None:
 
 
 def strip_internal_input_item_metadata(item: TResponseInputItem) -> TResponseInputItem:
-    """Remove SDK-only session metadata before sending items back to the model."""
+    """Remove SDK-only metadata and output-only fields before replaying items to the model.
+
+    ``created_by`` is server-assigned metadata on response output items (including
+    ``ResponseCompactionItem``) with no counterpart on the Responses input-item schema, so
+    replaying it is rejected with a 400. The ``to_input_items`` conversion boundary already
+    strips it; the client-managed session replay path goes through here, so it is stripped too.
+    """
     if not isinstance(item, dict):
         return item
 
     cleaned = dict(item)
     cleaned.pop(TOOL_CALL_SESSION_DESCRIPTION_KEY, None)
     cleaned.pop(TOOL_CALL_SESSION_TITLE_KEY, None)
+    cleaned.pop(CREATED_BY_KEY, None)
     return cast(TResponseInputItem, cleaned)
 
 

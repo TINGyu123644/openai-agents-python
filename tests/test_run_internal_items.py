@@ -700,6 +700,32 @@ def test_strip_metadata_and_reasoning_id_helpers_keep_non_matching_items() -> No
     assert run_items._without_reasoning_item_id(reasoning_without_id) == reasoning_without_id
 
 
+def test_strip_internal_input_item_metadata_removes_output_only_created_by() -> None:
+    """A replayed compaction item must lose the output-only ``created_by`` field.
+
+    ``ResponseCompactionItem`` carries ``created_by``, but the Responses input-item schema has no
+    such field, so replaying it returns a 400 ``Unknown parameter: 'input[N].created_by'``.
+    """
+    compaction_item = cast(
+        TResponseInputItem,
+        {
+            "type": "compaction",
+            "id": "compaction_1",
+            "encrypted_content": "blob",
+            "created_by": "server",
+            run_items.TOOL_CALL_SESSION_TITLE_KEY: "title",
+        },
+    )
+
+    cleaned = run_items.strip_internal_input_item_metadata(compaction_item)
+
+    assert cleaned == {
+        "type": "compaction",
+        "id": "compaction_1",
+        "encrypted_content": "blob",
+    }
+
+
 def test_deduplicate_input_items_handles_fake_ids_and_approval_request_ids() -> None:
     items: list[Any] = [
         cast(
