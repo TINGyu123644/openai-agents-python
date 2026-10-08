@@ -546,6 +546,29 @@ class OpenAIResponsesCompactionSession(SessionABC, OpenAIResponsesCompactionAwar
         output_items: list[TResponseInputItem],
         previous_items: list[TResponseInputItem],
     ) -> None:
+        # Backends that expose an atomic whole-history replacement (e.g. Redis)
+        # take the single-transaction path: delete + rebuild commit together, so
+        # concurrent readers never observe an empty session between clear and add.
+        atomic_replace = getattr(self.underlying_session, "replace_items", None)
+        if atomic_replace is not None:
+            try:
+                await atomic_replace(output_items)
+            except Exception as error:
+                await self._recover_from_failed_replacement(
+                    previous_items=previous_items,
+                    error=error,
+                    cleared=False,
+                )
+                raise
+            except asyncio.CancelledError as error:
+                await self._recover_from_failed_replacement(
+                    previous_items=previous_items,
+                    error=error,
+                    cleared=False,
+                )
+                raise
+            return
+
         # Treat clear → add as one replacement transaction. Exception and CancelledError
         # both restore previous history, and restore settlement is always drained so a
         # cancel during restore cannot leave an empty session.

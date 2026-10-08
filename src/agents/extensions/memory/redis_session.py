@@ -481,6 +481,8 @@ class RedisSession(SessionABC):
         keys: tuple[str, str, str],
         serialized_items: list[str] | None,
         completion_owned: asyncio.Event,
+        *,
+        replace: bool = False,
     ) -> _PipelineAttemptOutcome:
         """Run one watched append or clear attempt and finish its pipeline."""
         committed = False
@@ -556,6 +558,21 @@ class RedisSession(SessionABC):
                 if serialized_items is None:
                     batch_response_index = len(pipe.command_stack)
                     pipe.delete(*keys)
+                elif replace:
+                    # Whole-history replacement in a single transaction: the old
+                    # keys are deleted and the new items appended under the same
+                    # EXEC, so concurrent readers never observe an empty session
+                    # between clear and add.
+                    pipe.delete(*keys)
+                    pipe.hset(self._session_key, "session_id", self.session_id)
+                    pipe.hsetnx(self._session_key, "created_at", now)
+                    if serialized_items:
+                        batch_response_index = len(pipe.command_stack)
+                        pipe.rpush(self._messages_key, *serialized_items)
+                        pipe.hset(self._session_key, "updated_at", now)
+                    if expiration_time_ms is not None:
+                        for key in keys:
+                            pipe.pexpireat(key, expiration_time_ms)
                 else:
                     pipe.hset(self._session_key, "session_id", self.session_id)
                     pipe.hsetnx(self._session_key, "created_at", now)
@@ -605,14 +622,24 @@ class RedisSession(SessionABC):
     async def _mutate_items(
         self,
         serialized_items: list[str] | None,
+        *,
+        replace: bool = False,
     ) -> None:
-        """Atomically append a batch, or clear for None, after validating key types."""
+        """Atomically append a batch, clear for None, or replace for ``replace=True``.
+
+        Args:
+            serialized_items: Items to append. ``None`` clears all session keys.
+            replace: When true (and ``serialized_items`` is not None), the old
+                messages are deleted and the new batch appended in one transaction.
+        """
         keys = (self._session_key, self._messages_key, self._counter_key)
         while True:
             pipe = self._redis.pipeline()
             completion_owned = asyncio.Event()
             attempt = asyncio.create_task(
-                self._mutate_items_attempt(pipe, keys, serialized_items, completion_owned)
+                self._mutate_items_attempt(
+                    pipe, keys, serialized_items, completion_owned, replace=replace
+                )
             )
             outcome, cancellation = await _await_pipeline_attempt(attempt, completion_owned)
 
@@ -704,6 +731,26 @@ class RedisSession(SessionABC):
                 serialized_items.append(serialized)
 
             await self._mutate_items(serialized_items)
+
+    async def replace_items(self, items: list[TResponseInputItem]) -> None:
+        """Atomically replace the whole conversation history with ``items``.
+
+        Unlike a clear followed by an add (two separate Redis transactions),
+        this deletes the existing messages and appends the new batch inside a
+        single watched MULTI/EXEC transaction, so concurrent readers never
+        observe an empty session during a whole-history replacement (for
+        example during compaction).
+        """
+        self._check_not_closed()
+
+        async with self._lock:
+            self._check_not_closed()
+            serialized_items = []
+            for item in items:
+                serialized = await self._serialize_item(item)
+                serialized_items.append(serialized)
+
+            await self._mutate_items(serialized_items, replace=True)
 
     async def pop_item(self) -> TResponseInputItem | None:
         """Remove and return the most recent item from the session.

@@ -3286,3 +3286,110 @@ async def test_redis_session_operation_waiting_behind_close_raises():
                 task.cancel()
                 with suppress(asyncio.CancelledError, RuntimeError):
                     await task
+
+
+@pytest.mark.parametrize("decode_responses", [False, True])
+async def test_replace_items_replaces_whole_history_atomically(decode_responses: bool) -> None:
+    """replace_items must swap the full history in one transaction."""
+    if not USE_FAKE_REDIS:
+        pytest.skip("This test requires fakeredis")
+
+    import fakeredis.aioredis
+
+    client = fakeredis.aioredis.FakeRedis(decode_responses=decode_responses)
+    session = RedisSession(
+        "replace_session", redis_client=cast("Redis", client), key_prefix="test:"
+    )
+    old_items: list[TResponseInputItem] = [
+        {"role": "user", "content": "old one"},
+        {"role": "assistant", "content": "old two"},
+    ]
+    new_items: list[TResponseInputItem] = [
+        {"role": "user", "content": "new one"},
+        {"role": "assistant", "content": "new two"},
+        {"role": "user", "content": "new three"},
+    ]
+    try:
+        await session.add_items(old_items)
+        assert await session.get_items() == old_items
+
+        await session.replace_items(new_items)
+
+        assert await session.get_items() == new_items
+        # Metadata is preserved/refreshed, never emptied by replacement.
+        assert await client.hget(session._session_key, "session_id") in (
+            b"replace_session",
+            "replace_session",
+        )
+        assert await client.hget(session._session_key, "created_at") is not None
+    finally:
+        await client.aclose()
+
+
+async def test_replace_items_retries_on_concurrent_modification() -> None:
+    """A replace racing another writer must retry and settle on the winner's view."""
+    if not USE_FAKE_REDIS:
+        pytest.skip("This test requires fakeredis")
+
+    import unittest.mock
+
+    import fakeredis.aioredis
+
+    client = fakeredis.aioredis.FakeRedis()
+    session = RedisSession("replace_race", redis_client=cast("Redis", client))
+    # A separate session instance shares the client but owns its own lock, so the
+    # competing write can run while the replace pipeline is paused mid-flight.
+    racer = RedisSession("replace_race", redis_client=cast("Redis", client))
+    old_items: list[TResponseInputItem] = [{"role": "user", "content": "original"}]
+    new_items: list[TResponseInputItem] = [
+        {"role": "user", "content": "replacement one"},
+        {"role": "assistant", "content": "replacement two"},
+    ]
+    try:
+        await session.add_items(old_items)
+        first_attempt = asyncio.Event()
+        original_pipeline = client.pipeline
+        attempts = 0
+
+        def racing_pipeline(*args: Any, **kwargs: Any) -> Any:
+            nonlocal attempts
+            pipe = original_pipeline(*args, **kwargs)
+            attempts += 1
+            if attempts == 1:
+                # Before the replace pipeline executes, inject a competing write
+                # so WATCH detects the change and forces a retry.
+                original_execute = pipe.execute
+
+                async def racing_execute(*args: Any, **kwargs: Any) -> Any:
+                    await racer.add_items([{"role": "user", "content": "racing write"}])
+                    first_attempt.set()
+                    return await original_execute(*args, **kwargs)
+
+                pipe.execute = racing_execute
+            return pipe
+
+        with unittest.mock.patch.object(client, "pipeline", racing_pipeline):
+            await session.replace_items(new_items)
+
+        # The retry must win with the requested items, not the racing write.
+        assert await session.get_items() == new_items
+        assert first_attempt.is_set()
+    finally:
+        await client.aclose()
+
+
+async def test_replace_items_empty_list_clears_history() -> None:
+    """Replacing with an empty list must leave an empty session, not raise."""
+    if not USE_FAKE_REDIS:
+        pytest.skip("This test requires fakeredis")
+
+    import fakeredis.aioredis
+
+    client = fakeredis.aioredis.FakeRedis()
+    session = RedisSession("replace_empty", redis_client=cast("Redis", client))
+    try:
+        await session.add_items([{"role": "user", "content": "to be cleared"}])
+        await session.replace_items([])
+        assert await session.get_items() == []
+    finally:
+        await client.aclose()
