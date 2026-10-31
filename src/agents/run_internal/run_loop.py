@@ -71,6 +71,7 @@ from ..models._response_terminal import (
     response_terminal_failure_error,
 )
 from ..models._run_context import model_run_context, model_run_context_stream
+from ..models.fake_id import FAKE_RESPONSES_ID
 from ..result import RunResultStreaming
 from ..run_config import ReasoningItemIdPolicy, RunConfig
 from ..run_context import AgentHookContext, RunContextWrapper, TContext
@@ -2702,7 +2703,15 @@ async def run_single_turn_streamed(
                 final_response = ModelResponse(
                     output=terminal_response.output,
                     usage=usage,
-                    response_id=terminal_response.id,
+                    # Adapters built on non-Responses APIs (e.g. Chat Completions) use a
+                    # placeholder id for the streamed Response. Report None instead, like
+                    # the non-streamed path does, so downstream consumers don't treat the
+                    # placeholder as a real server-side response id.
+                    response_id=(
+                        None
+                        if terminal_response.id == FAKE_RESPONSES_ID
+                        else terminal_response.id
+                    ),
                     request_id=getattr(terminal_response, "_request_id", None),
                     raw_usage=(
                         _extract_raw_usage_snapshot(terminal_response)

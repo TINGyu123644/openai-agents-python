@@ -57,6 +57,7 @@ from agents.items import (
     TResponseStreamEvent,
 )
 from agents.memory.openai_conversations_session import OpenAIConversationsSession
+from agents.models.fake_id import FAKE_RESPONSES_ID
 from agents.models.interface import Model
 from agents.run import RunConfig
 from agents.run_internal import run_loop
@@ -399,6 +400,87 @@ async def test_streamed_run_exposes_request_id_on_raw_responses(
         if preserve_raw_usage is True
         else None
     )
+
+
+@pytest.mark.asyncio
+async def test_streamed_run_maps_fake_response_id_to_none() -> None:
+    """Streaming adapters built on non-Responses APIs (e.g. Chat Completions) emit a
+    terminal Response carrying the FAKE_RESPONSES_ID placeholder. The runner must report
+    response_id=None for such turns, the same as the non-streamed path, so the placeholder
+    is never treated as a real server-side response id (e.g. as previous_response_id)."""
+
+    class FakeIdTerminalScriptedModel(ScriptedModel):
+        async def stream_response(
+            self,
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            output_schema,
+            handoffs,
+            tracing,
+            *,
+            previous_response_id=None,
+            conversation_id=None,
+            prompt=None,
+        ):
+            response = get_response_obj(
+                [get_text_message("done")], response_id=FAKE_RESPONSES_ID
+            )
+            yield ResponseCompletedEvent(
+                type="response.completed",
+                response=response,
+                sequence_number=0,
+            )
+
+    model = FakeIdTerminalScriptedModel()
+    agent = Agent(name="test", model=model)
+
+    result = Runner.run_streamed(agent, input="test")
+    async for _ in result.stream_events():
+        pass
+
+    assert len(result.raw_responses) == 1
+    assert result.raw_responses[0].response_id is None
+    assert result.last_response_id is None
+
+
+@pytest.mark.asyncio
+async def test_streamed_run_preserves_real_response_id() -> None:
+    class RealIdTerminalScriptedModel(ScriptedModel):
+        async def stream_response(
+            self,
+            system_instructions,
+            input,
+            model_settings,
+            tools,
+            output_schema,
+            handoffs,
+            tracing,
+            *,
+            previous_response_id=None,
+            conversation_id=None,
+            prompt=None,
+        ):
+            response = get_response_obj(
+                [get_text_message("done")], response_id="resp_real_123"
+            )
+            yield ResponseCompletedEvent(
+                type="response.completed",
+                response=response,
+                sequence_number=0,
+            )
+
+    model = RealIdTerminalScriptedModel()
+    agent = Agent(name="test", model=model)
+
+    result = Runner.run_streamed(agent, input="test")
+    async for _ in result.stream_events():
+        pass
+
+    assert len(result.raw_responses) == 1
+    assert result.raw_responses[0].response_id == "resp_real_123"
+    assert result.last_response_id == "resp_real_123"
 
 
 @pytest.mark.asyncio
